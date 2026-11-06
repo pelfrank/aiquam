@@ -7,13 +7,53 @@ import pickle
 import numpy as np
 from shapely.geometry import Polygon, Point
 from tensorflow import keras
-from main import load_areas, get_lat_long, worker, get_index_lat_long
-# from training import KnnDtw
+from geo_utils import load_areas, get_lat_long, get_index_lat_long
+from config import cfg_inference as cfg
+# from knn_dtw import KnnDtw
 # import matplotlib.pyplot as plt
-from configparser import ConfigParser
 
-cfg = ConfigParser()
-cfg.read('config.ini')
+
+def _open_nc(url):
+    """
+    Apre un file NetCDF con cache locale opzionale.
+
+    Se cfg.nc_root è impostato:
+      1. Cerca il file in <nc_root>/YYYY/MM/DD/wcm3_d03_<datetime>.nc
+      2. Se trovato, lo apre direttamente da disco.
+      3. Se non trovato, lo scarica via OPeNDAP, lo salva su disco e lo restituisce.
+    Se cfg.nc_root non è impostato, usa sempre OPeNDAP senza salvare.
+    """
+    if not cfg.nc_root:
+        return Dataset(url)
+
+    rel        = url.replace(cfg.url, "")           # YYYY/MM/DD/wcm3_d03_*.nc
+    local_path = os.path.join(cfg.nc_root, rel)
+
+    if os.path.exists(local_path):
+        return Dataset(local_path)
+
+    # Non trovato: scarica via OPeNDAP e salva su disco
+    print(f"  [nc_root] non trovato in locale, scarico: {rel}")
+    remote = Dataset(url)
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    tmp = local_path + ".tmp"
+    try:
+        local_ds = Dataset(tmp, "w", format="NETCDF4")
+        for name, dim in remote.dimensions.items():
+            local_ds.createDimension(name, len(dim) if not dim.isunlimited() else None)
+        for name, var in remote.variables.items():
+            out_var = local_ds.createVariable(name, var.dtype, var.dimensions)
+            out_var.setncatts({k: var.getncattr(k) for k in var.ncattrs()})
+            out_var[:] = var[:]
+        local_ds.close()
+        import shutil
+        shutil.move(tmp, local_path)
+        print(f"  [nc_root] salvato in {local_path}")
+    except Exception as e:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        print(f"  [nc_root] impossibile salvare {local_path}: {e}")
+    return remote
 
 
 def get_datatime(file):
@@ -21,7 +61,7 @@ def get_datatime(file):
 
     lines = pd.read_csv(file, delimiter=';')
     for line in lines.iterrows():
-        date = str(line[1]['DATA PRELIEVO']) + cfg.get('variables', 'SAMPLE_HOUR')
+        date = str(line[1]['DATA PRELIEVO']) + cfg.sample_hour
         if not any(d == date for d in arr):
             arr.append(date)
 
@@ -29,22 +69,39 @@ def get_datatime(file):
 
 
 def prediction(lat, long, delta_lat, delta_long, _datetime):
-    src = cfg.get('variables', 'URL') + _datetime[0:4] + "/" + _datetime[4:6] + "/" + _datetime[6:8] + \
+    os.makedirs("output", exist_ok=True)
+    src = cfg.url + _datetime[0:4] + "/" + _datetime[4:6] + "/" + _datetime[6:8] + \
           "/wcm3_d03_" + _datetime + ".nc"
-    dst = "output/wcm3_d03_" + _datetime + ".nc.nc4"
+    dst = "output/aiq3_d03_" + _datetime + ".nc.nc4"
 
     ncsrcfile = Dataset(src)
 
-    ncols = len(long)
-    nrows = len(lat)
+    # Legge lat/lon/depth direttamente dal file sorgente (il dominio può
+    # variare tra anni diversi — non usare le dimensioni del file di riferimento)
+    src_lat   = np.array(ncsrcfile.variables['latitude'][:])
+    src_long  = np.array(ncsrcfile.variables['longitude'][:])
+    src_depth = ncsrcfile.variables['depth'][:]
+    nrows     = len(src_lat)
+    ncols     = len(src_long)
+    ndepth    = len(src_depth)
+
+    # Ricalcola delta_lat e delta_long sulla griglia sorgente
+    N = len(src_lat)
+    delta_lat  = sum(src_lat[i]  - src_lat[i-1]  for i in range(1, N)) / N
+    M = len(src_long)
+    delta_long = sum(src_long[i] - src_long[i-1] for i in range(1, M)) / M
+
+    # Sovrascrive lat/long con quelli del file sorgente
+    lat   = src_lat
+    long  = src_long
 
     print("Loading completed!")
 
     ncdstfile = Dataset(dst, "w", format="NETCDF4")
-    timeDim = ncdstfile.createDimension("time", size=1)
-    depthDim = ncdstfile.createDimension("depth", size=11)
-    latDim = ncdstfile.createDimension("latitude", size=nrows)
-    lonDim = ncdstfile.createDimension("longitude", size=ncols)
+    timeDim  = ncdstfile.createDimension("time",      size=1)
+    depthDim = ncdstfile.createDimension("depth",     size=ndepth)
+    latDim   = ncdstfile.createDimension("latitude",  size=nrows)
+    lonDim   = ncdstfile.createDimension("longitude", size=ncols)
 
     timeVar = ncdstfile.createVariable("time", "i4", "time")
     timeVar.description = "Time since initialization"
@@ -65,7 +122,7 @@ def prediction(lat, long, delta_lat, delta_long, _datetime):
 
     latVar = ncdstfile.createVariable("latitude", "f4", "latitude")
     latVar.description = "Latitude"
-    lonVar.long_name = "latitude"
+    latVar.long_name = "latitude"
     latVar.units = "degrees_north"
 
     concVar = ncdstfile.createVariable("conc", "f4", ("time", "depth", "latitude", "longitude"), fill_value=1.e+37)
@@ -82,18 +139,18 @@ def prediction(lat, long, delta_lat, delta_long, _datetime):
     classVar.description = "predicted class of concentration of pollutants in mussels"
     classVar.long_name = "class_predict"
 
-    timeVar[:] = ncsrcfile.variables["time"][:]
-    depthVar[:] = [0, -2.5, -5, -10, -15, -20, -25, -50, -100, -200, -300]
-    lonVar[:] = long
-    latVar[:] = lat
-    concVar[:] = ncsrcfile.variables["conc"][:]
+    timeVar[:]  = ncsrcfile.variables["time"][:]
+    depthVar[:] = src_depth
+    lonVar[:]   = long
+    latVar[:]   = lat
+    concVar[:]  = ncsrcfile.variables["conc"][:]
     sfconcVar[:] = ncsrcfile.variables["sfconc"][:]
 
     print("Creating Dataset...")
 
     dataset = []
 
-    for h in range(cfg.getint('variables', 'START'), cfg.getint('variables', 'END') + 1):
+    for h in range(cfg.start, cfg.end + 1):
         reference_hour = datetime.strptime(_datetime, "%Y%m%dZ%H%M") - timedelta(hours=h)
         formatted_hour = reference_hour.strftime("%Y%m%dZ%H%M")
 
@@ -102,9 +159,9 @@ def prediction(lat, long, delta_lat, delta_long, _datetime):
         month = '{:>02d}'.format(reference_hour.month)
         day = '{:>02d}'.format(reference_hour.day)
 
-        url = cfg.get('variables', 'URL') + year + "/" + month + "/" + day + "/wcm3_d03_" + formatted_hour + ".nc"
+        url = cfg.url + year + "/" + month + "/" + day + "/wcm3_d03_" + formatted_hour + ".nc"
         try:
-            _dataset = Dataset(url)
+            _dataset = _open_nc(url)
             concentration = _dataset['conc'][0][0]
         except:
             concentration = np.zeros((nrows, ncols))
@@ -131,20 +188,24 @@ def prediction(lat, long, delta_lat, delta_long, _datetime):
                     point = Point(long[j], lat[i])
                     if point.within(area_poly):
                         id = str(i) + "_" + str(j) + "_" + str(code)
+                        val = float(concentration[i][j]) if np.isfinite(float(concentration[i][j])) else 0.0
                         if not any(d['id'] == id for d in dataset):
-                            dataset.append({"id": id, "features": [concentration[i][j]]})
+                            dataset.append({"id": id, "features": [val]})
                         else:
                             index = [i for i, _ in enumerate(dataset) if _["id"] == id][0]
-                            dataset[index]["features"].append(concentration[i][j])
+                            dataset[index]["features"].append(val)
     # print(dataset)
     print("Dataset Created!")
 
     print("Prediction...")
 
+    model = pickle.load(open(os.path.join('models', 'KNeighborsClassifier.pkl'), 'rb'))
+
     for pixel in dataset:
-        features = pixel["features"]
-        model = pickle.load(open('KNeighborsClassifier', 'rb'))
-        y_pred_knn = model.predict(np.array([features, ]))
+        # Sostituisce valori mascherati/NaN con 0.0 (fill_value OPeNDAP → assenza di concentrazione)
+        features = np.array(pixel["features"], dtype=np.float64)
+        features = np.where(np.isfinite(features), features, 0.0)
+        y_pred_knn = model.predict(features.reshape(1, -1))
         # print("[KNeighborsClassifier] Class: ", int(y_pred_knn[0]))
         print("End Prediction!")
 
@@ -181,9 +242,10 @@ if __name__ == "__main__":
             try:
                 _datetime = sys.argv[1]
                 prediction(lat, long, delta_lat, delta_long, _datetime)
-            except:
-                print("Error!")
-                pass
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print("Error:", e)
 
         """
         # new_datetime = _datetime[6:8] + "/" + _datetime[4:6] + "/" + _datetime[2:4] + "/" + _datetime[9:11] + ":00"
@@ -219,16 +281,16 @@ if __name__ == "__main__":
 
         print("Prediction...")
 
-        model_cnn = keras.models.load_model('CNN')
+        model_cnn = keras.models.load_model(os.path.join('models', 'CNN.keras'))
         y_pred_cnn = np.argmax(model_cnn.predict([np.array([features, ]), np.array([features, ]), np.array([features, ])]), axis=1)
 
-        model_resnet = keras.models.load_model('ResNet')
+        model_resnet = keras.models.load_model(os.path.join('models', 'ResNet.keras'))
         y_pred_resnet = np.argmax(model_resnet.predict(np.array([features, ])), axis=1)
 
-        model_2knn = pickle.load(open('KNeighborsClassifier', 'rb'))
+        model_2knn = pickle.load(open(os.path.join('models', 'KNeighborsClassifier.pkl'), 'rb'))
         y_pred_knn = model_2knn.predict(np.array([features, ]))
 
-        model_knn_dtw = pickle.load(open('KNN_DTW', 'rb'))
+        model_knn_dtw = pickle.load(open(os.path.join('models', 'KNN_DTW.pkl'), 'rb'))
         y_pred_knn_dtw, _ = model_knn_dtw.predict(np.array([features, ]))
 
         print("[CNN] Class: ", y_pred_cnn[0])

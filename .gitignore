@@ -1,0 +1,6 @@
+dataset/
+models/
+output/
+prints/
+__pycache__/
+.venv/
